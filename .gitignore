@@ -170,5 +170,5 @@ cython_debug/
 output*/
 .vscode/
 .DS_Store
-*data
+*data*/
 superpower/
