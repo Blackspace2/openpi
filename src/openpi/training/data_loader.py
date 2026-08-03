@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
@@ -127,6 +128,26 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _load_episode_split_ids(dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, split: Literal["train", "val"]) -> list[int]:
+    """Reads the `meta/openpi_episode_split.json` manifest (written by
+    examples/aloha_real/convert_aloha_data_to_lerobot.py) and returns the sorted converted episode ids
+    belonging to `split`.
+    """
+    manifest_path = dataset_meta.root / "meta" / "openpi_episode_split.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Requested episode_split={split!r} but no split manifest was found at {manifest_path}. "
+            "Convert the dataset with a converter that writes this manifest, or use episode_split='all'."
+        )
+    manifest = json.loads(manifest_path.read_text())
+    episode_ids = sorted(
+        record["converted_episode_id"] for record in manifest["episodes"] if record["split"] == split
+    )
+    if not episode_ids:
+        raise ValueError(f"No episodes found for split {split!r} in {manifest_path}.")
+    return episode_ids
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -138,17 +159,24 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    episodes = (
+        _load_episode_split_ids(dataset_meta, data_config.episode_split)
+        if data_config.episode_split != "all"
+        else None
+    )
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        episodes=episodes,
     )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
 
 
 def create_rlds_dataset(

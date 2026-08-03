@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.mobile_aloha_policy as mobile_aloha_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -90,6 +91,11 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Which episodes to load from the dataset, based on the train/val split recorded in the dataset's
+    # `meta/openpi_episode_split.json` manifest (see examples/aloha_real/convert_aloha_data_to_lerobot.py).
+    # "all" preserves the default LeRobotDataset behavior of loading every episode.
+    episode_split: Literal["all", "train", "val"] = "all"
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -118,7 +124,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),   # 只编码文本 prompt
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -131,12 +137,12 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
+                            discrete_state_input=model_config.discrete_state_input,  # 将 state 编码为离散 token 也作为 prefix 
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
-            case _model.ModelType.PI0_FAST:
+            case _model.ModelType.PI0_FAST:  # FAST
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
                     if model_config.fast_model_tokenizer is None
@@ -261,6 +267,72 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
         if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotMobileAlohaDataConfig(DataConfigFactory):
+    """Data config for Mobile Aloha (14D state, 16D action = 14 arm/gripper dims + 2 base velocity dims).
+
+    Unlike `LeRobotAlohaDataConfig`, this uses `MobileAlohaInputs`/`MobileAlohaOutputs`, which preserve the
+    16 physical action dims (instead of truncating to 14) and only map the three Mobile Aloha cameras
+    (no cam_low).
+    """
+
+    # If true, will convert the arm joint dimensions to deltas with respect to the current state before
+    # passing to the model. Gripper and base velocity dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model.
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[mobile_aloha_policy.MobileAlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[mobile_aloha_policy.MobileAlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            # Deliberately 14-dim (not padded to 16): DeltaActions/AbsoluteActions only touch
+            # actions[..., :mask.shape[-1]], so the trailing 2 base-velocity dims are left untouched
+            # and remain absolute.
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -742,7 +814,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=True),  # debug pi0.5 暂时改为 True
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -819,6 +891,27 @@ _CONFIGS = [
                         }
                     )
                 ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+    ),
+    # Fine-tuning pi0.5 on Mobile Aloha data (14D state, 16D physical action = 14 arm/gripper + 2 base
+    # velocity dims, padded to the pi0.5 model's 32D action interface). See
+    # examples/aloha_real/convert_aloha_data_to_lerobot.py for the dataset converter, which also writes the
+    # `meta/openpi_episode_split.json` train/val manifest consumed via `episode_split="train"` below.
+    TrainConfig(
+        name="pi05_mobile_aloha",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotMobileAlohaDataConfig(
+            repo_id="mobile_aloha",
+            # Mobile Aloha's 16D action space (14 arm/gripper + 2 base velocity) differs from the
+            # standard 14D trossen action space, so norm stats must be computed from this dataset's
+            # train split (via scripts/compute_norm_stats.py) rather than borrowed from pi05_base.
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_split="train",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

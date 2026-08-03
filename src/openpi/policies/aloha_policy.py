@@ -200,3 +200,18 @@ def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np
         actions = _joint_flip_mask() * actions
         actions[:, [6, 13]] = _gripper_from_angular_inv(actions[:, [6, 13]])
     return actions
+
+
+def aloha_state_to_pi(state: np.ndarray, *, adapt_to_pi: bool = True) -> np.ndarray:
+    """Converts a 14D Aloha state into the pi internal joint/gripper space. Copies the input first."""
+    return _decode_state(np.array(state, copy=True), adapt_to_pi=adapt_to_pi)
+
+
+def aloha_actions_to_pi(actions: np.ndarray, *, adapt_to_pi: bool = True) -> np.ndarray:
+    """Converts 14D Aloha actions into the pi internal joint/gripper space. Copies the input first."""
+    return _encode_actions_inv(np.array(actions, copy=True), adapt_to_pi=adapt_to_pi)
+
+
+def pi_actions_to_aloha(actions: np.ndarray, *, adapt_to_pi: bool = True) -> np.ndarray:
+    """Converts 14D pi actions back into the standard Aloha joint/gripper space. Copies the input first."""
+    return _encode_actions(np.array(actions, copy=True), adapt_to_pi=adapt_to_pi)
