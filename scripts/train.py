@@ -147,8 +147,8 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)  # [B, H]
+        return jnp.mean(chunked_loss)  # 当前 batch 内所有样本、所有动作时刻、所有动作维度的平均 MSE Loss
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Gemma adaptation for Pi, taken from big_vision.
+    Google research big_vision Gemma: https://github.com/google-research/big_vision/blob/main/big_vision/models/ppp/gemma.py
 
 We follow this einsum axis naming convention:
   B: batch
@@ -111,6 +112,32 @@ def get_config(variant: Variant) -> Config:
 
 @at.typecheck
 class RMSNorm(nn.Module):
+    """
+    RMSNorm 在每个 token 的最后一个特征维度上独立进行归一化
+    LayerNorm 和 RMSNorm: 
+    - LayerNorm:
+        \frac{x-\mu}{\sqrt{\sigma^2+\varepsilon}}
+    - RMSNorm:
+        \frac{x}{\sqrt{\frac{1}{D}\sum_d x_d^2+\varepsilon}}
+    
+    普通 RMSNorm, s 是可学习的:
+    \operatorname{RMSNorm}(\mathbf x)
+    =
+    \frac{\mathbf x}
+    {\sqrt{\frac{1}{D}\|\mathbf x\|_2^2+\varepsilon}}
+    \odot(1+\mathbf s)
+
+    自适应 RMSNorm, s,β,g 是从 cond 中学习出来的: 
+    \operatorname{AdaRMSNorm}(\mathbf x,\mathbf c)
+    =
+    \frac{\mathbf x}
+    {\sqrt{\frac{1}{D}\|\mathbf x\|_2^2+\varepsilon}}
+    \odot(1+\mathbf s)
+    +
+    \boldsymbol\beta
+
+    并额外输出可学习的门控信号 g
+    """
     @nn.compact
     def __call__(self, x, cond):
         dtype = x.dtype  # original dtype, could be half-precision
@@ -125,8 +152,8 @@ class RMSNorm(nn.Module):
             return normed_inputs.astype(dtype), None  # return in original dtype
 
         # adaptive RMSNorm
-        modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)  # 根据 time_cond 生成 3 组调制参数
+        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)  # s,β,g
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -156,7 +183,16 @@ class Embedder(nn.Module):
 
 @at.typecheck
 class Attention(nn.Module):
-    """Attention module."""
+    """Attention module.
+    B: Batch size
+    T: Query token 数量
+    S: Key/Value token 数量
+    D: 模型隐藏维度，如 2048 或 1024
+    N: Query Attention head 数量
+    K: KV head 数量
+    G: 每个 KV head 对应的 Query head 数量， N = K * G
+    H: 每个 head 的维度 head_dim
+    """
 
     configs: Sequence[Config]
 
@@ -246,12 +282,23 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v)  # 保存 kv cache
 
 
 @at.typecheck
 class FeedForward(nn.Module):
-    """Feed forward module."""
+    """Feed forward module.
+
+    g=GeLU(x W_{gate})
+    u=xW_{up}
+    h=g \odot u
+    y=h W_{down}
+    相比普通 FFN 多了一路 gate:
+
+                    ┌→ W_gate → GELU ─┐
+    x [B,T,D] ──────┤                 * → W_down → y [B,T,D]
+                    └→ W_up ──────────┘
+    """
 
     features: int
     hidden_dim: int
@@ -389,7 +436,7 @@ class Module(nn.Module):
     def __call__(
         self,
         # list of token arrays, one for each expert, or None if that expert should not be run
-        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
+        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],  # 共享 batch_size；token数可以不同；embedding width 可以不同
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
@@ -398,17 +445,17 @@ class Module(nn.Module):
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
-        mask = jnp.asarray(mask)[:, None, :, :]
+        mask = jnp.asarray(mask)[:, None, :, :]  # 扩展 multi-head
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
-
+        # 经过固定路由双专家 Transformer，18 层
         embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
-
+        # Pre-Norm Transformer 最后需要经过一个 Norm 归一化层
         return [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ], kv_cache  # [prefix_out, suffix_out], kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

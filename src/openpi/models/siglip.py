@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A refactored and simplified ViT adoptation for Pi, taken from big_vision."""
+"""A refactored and simplified ViT adoptation for Pi, taken from big_vision.
+    Google research big_vision SigLIP: https://github.com/google-research/big_vision/blob/main/big_vision/models/vit.py
+"""
 
 from collections.abc import Sequence
 
