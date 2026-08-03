@@ -3,6 +3,8 @@ import dataclasses
 import logging
 import math
 import pathlib
+import time
+from typing import List, Optional
 
 import imageio
 from libero.libero import benchmark
@@ -36,6 +38,7 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    max_tasks: Optional[int] = None  # If set, only run the first N tasks of the suite (for quick smoke tests)
 
     #################################################################################################################
     # Utils
@@ -53,7 +56,9 @@ def eval_libero(args: Args) -> None:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
-    logging.info(f"Task suite: {args.task_suite_name}")
+    if args.max_tasks is not None:
+        num_tasks_in_suite = min(num_tasks_in_suite, args.max_tasks)
+    logging.info(f"Task suite: {args.task_suite_name} (running {num_tasks_in_suite} task(s))")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
@@ -71,6 +76,25 @@ def eval_libero(args: Args) -> None:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+
+    # Warm up the policy server once so the first (JAX JIT compile) call doesn't pollute the
+    # timing stats below. Shapes/dtypes must match a real request; prompt content doesn't matter
+    # since prompts are padded to a fixed token length before hitting the model.
+    logging.info("Warming up policy server (triggers one-time JAX JIT compilation)...")
+    warmup_obs = {
+        "observation/image": np.zeros((args.resize_size, args.resize_size, 3), dtype=np.uint8),
+        "observation/wrist_image": np.zeros((args.resize_size, args.resize_size, 3), dtype=np.uint8),
+        "observation/state": np.zeros(8, dtype=np.float32),
+        "prompt": "warmup",
+    }
+    warmup_start = time.monotonic()
+    client.infer(warmup_obs)
+    logging.info(f"Warmup done in {(time.monotonic() - warmup_start) * 1000:.1f} ms")
+
+    # Inference timing stats (ms), collected across all client.infer() calls.
+    policy_infer_times = []
+    server_infer_times = []
+    server_total_times = []
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -141,11 +165,18 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        result = client.infer(element)  # 模型推理
+                        action_chunk = result["actions"]  # 取出模型预测的 action chunk
+                        if "policy_timing" in result:
+                            policy_infer_times.append(result["policy_timing"]["infer_ms"])
+                        if "server_timing" in result:
+                            server_infer_times.append(result["server_timing"]["infer_ms"])
+                            if "prev_total_ms" in result["server_timing"]:
+                                server_total_times.append(result["server_timing"]["prev_total_ms"])
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
-                        action_plan.extend(action_chunk[: args.replan_steps])
+                        action_plan.extend(action_chunk[: args.replan_steps])  # 只执行指定的步数的 action，而不是执行 action_chunk 全部内容
 
                     action = action_plan.popleft()
 
@@ -184,6 +215,21 @@ def eval_libero(args: Args) -> None:
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    _log_timing_summary("policy_timing.infer_ms (model forward only)", policy_infer_times)
+    _log_timing_summary("server_timing.infer_ms (== policy_timing, server-side)", server_infer_times)
+    _log_timing_summary("server_timing.prev_total_ms (server recv->send, prev request)", server_total_times)
+
+
+def _log_timing_summary(name: str, samples: List[float]) -> None:
+    if not samples:
+        logging.info(f"[timing] {name}: no samples collected")
+        return
+    arr = np.asarray(samples)
+    logging.info(
+        f"[timing] {name}: n={len(arr)} mean={arr.mean():.1f}ms p50={np.percentile(arr, 50):.1f}ms "
+        f"p95={np.percentile(arr, 95):.1f}ms min={arr.min():.1f}ms max={arr.max():.1f}ms"
+    )
 
 
 def _get_libero_env(task, resolution, seed):
