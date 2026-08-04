@@ -1,3 +1,5 @@
+import numpy as np
+
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 
@@ -41,4 +43,28 @@ def test_mobile_aloha_data_config_create_wires_14dim_delta_mask(tmp_path):
     assert len(absolute_actions[0].mask) == 14
 
     assert data_config.action_sequence_keys == ("action",)
+
+
+def test_mobile_aloha_repack_preserves_prompt(tmp_path):
+    """Regression test: prompt_from_task=True adds "prompt" to the raw sample before repack runs
+    (see create_torch_dataset), but RepackTransform rebuilds the dict from scratch using only the
+    keys in its mapping. Without an explicit "prompt": "prompt" entry, the prompt is silently
+    dropped and TokenizePrompt later raises "Prompt is required"."""
+    config = _config.get_config("pi05_mobile_aloha")
+    data_config = config.data.create(tmp_path, config.model)
+
+    raw_sample = {
+        "observation.images.cam_high": np.zeros((3, 224, 224), dtype=np.uint8),
+        "observation.images.cam_left_wrist": np.zeros((3, 224, 224), dtype=np.uint8),
+        "observation.images.cam_right_wrist": np.zeros((3, 224, 224), dtype=np.uint8),
+        "observation.state": np.zeros((14,), dtype=np.float32),
+        "action": np.zeros((50, 16), dtype=np.float32),
+        "prompt": "open the cabinet",
+    }
+
+    repacked = _transforms.compose(data_config.repack_transforms.inputs)(raw_sample)
+
+    assert "prompt" in repacked
+    assert str(repacked["prompt"]) == "open the cabinet"
+
 

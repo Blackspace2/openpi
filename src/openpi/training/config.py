@@ -315,6 +315,10 @@ class LeRobotMobileAlohaDataConfig(DataConfigFactory):
                         },
                         "state": "observation.state",
                         "actions": "action",
+                        # Without this, RepackTransform drops the "prompt" key added by
+                        # PromptFromLeRobotTask (applied before repack in create_torch_dataset),
+                        # since it only keeps keys present in this mapping.
+                        "prompt": "prompt",
                     }
                 )
             ]
