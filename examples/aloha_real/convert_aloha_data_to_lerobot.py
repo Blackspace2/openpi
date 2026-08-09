@@ -23,20 +23,18 @@ left arm/gripper, right arm/gripper, base linear velocity, and base angular velo
 import dataclasses
 import io
 import json
+from pathlib import Path
 import random
 import re
 import shutil
-from pathlib import Path
 from typing import Literal
 
 import h5py
 from lerobot.common.constants import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.push_dataset_to_hub._download_raw import download_raw
 import numpy as np
 import tqdm
 import tyro
-
 
 FPS = 50
 ALOHA_MOTOR_NAMES = (
@@ -521,6 +519,13 @@ def port_aloha(
     if not raw_dir.exists():
         if raw_repo_id is None:
             raise ValueError("raw_repo_id must be provided if raw_dir does not exist")
+        try:
+            from lerobot.common.datasets.push_dataset_to_hub._download_raw import download_raw
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "download_raw is not available in the pinned lerobot version; "
+                "download the raw dataset manually and pass --raw-dir to an existing directory."
+            ) from e
         download_raw(raw_dir, repo_id=raw_repo_id)
 
     episode_specs = discover_episode_specs(raw_dir, task, task_prompts_path)
