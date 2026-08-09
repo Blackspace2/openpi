@@ -187,6 +187,10 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        # optax.apply_if_finite wraps the optimizer (see optimizer.create_optimizer) to skip
+        # updates on non-finite gradients instead of letting them corrupt params; surface the
+        # running total here so silent skips are still visible in the log.
+        "total_notfinite": new_opt_state.total_notfinite,
     }
     return new_state, info
 

@@ -106,4 +106,12 @@ def create_optimizer(
     optimizer: OptimizerConfig, lr_schedule: LRScheduleConfig, weight_decay_mask: at.PyTree | None = None
 ) -> optax.GradientTransformation:
     lr = lr_schedule.create()
-    return optimizer.create(lr, weight_decay_mask=weight_decay_mask)
+    tx = optimizer.create(lr, weight_decay_mask=weight_decay_mask)
+    # Multi-GPU runs on this cluster intermittently produce a single step of non-finite
+    # gradients (see openpi issue #822 -- open, upstream, JAX/XLA multi-device collective
+    # issue, not reproducible on a single GPU). clip_by_global_norm cannot help once a
+    # gradient is already NaN/Inf, so skip the update entirely on those steps instead of
+    # letting it permanently corrupt the params. If corruption is persistent rather than a
+    # transient blip, this gives up and applies the update anyway after 25 consecutive hits
+    # so a real failure is still visible rather than silently stalled forever.
+    return optax.apply_if_finite(tx, max_consecutive_errors=25)
