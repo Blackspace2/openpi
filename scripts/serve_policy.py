@@ -51,6 +51,10 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Number of flow-matching / diffusion denoising steps used at inference time. Defaults to the
+    # model's own default (10 for pi0/pi0.5) when not set.
+    num_steps: int | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -76,24 +80,33 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(
+    env: EnvMode, *, default_prompt: str | None = None, sample_kwargs: dict | None = None
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config),
+            checkpoint.dir,
+            default_prompt=default_prompt,
+            sample_kwargs=sample_kwargs,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    sample_kwargs = {"num_steps": args.num_steps} if args.num_steps is not None else None
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_kwargs=sample_kwargs,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, sample_kwargs=sample_kwargs)
 
 
 def main(args: Args) -> None:

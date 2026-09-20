@@ -53,7 +53,9 @@ def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
 
 
 class MlpBlock(nn.Module):
-    """Transformer MLP / feed-forward block."""
+    """Transformer MLP / feed-forward block.
+    FFN
+    """
 
     mlp_dim: int | None = None  # Defaults to 4x input dim
     dropout: float = 0.0
@@ -70,22 +72,24 @@ class MlpBlock(nn.Module):
         _, _, d = x.shape  # n,l,d
         x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(x)
         x = nn.gelu(x)
-        x = nn.Dropout(rate=self.dropout)(x, deterministic)
+        x = nn.Dropout(rate=self.dropout)(x, deterministic)  #  deterministic=True/False 训练/推理 开关
         return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
 
 
 class Encoder1DBlock(nn.Module):
-    """Single transformer encoder block (MHSA + MLP)."""
+    """Single transformer encoder block (MHSA + MLP).
+    标准的 Pre-Norm Encoder-only Transformer 结构
+    """
 
     mlp_dim: int | None = None  # Defaults to 4x input dim
     num_heads: int = 12
     dropout: float = 0.0
-    dtype_mm: str = "float32"
+    dtype_mm: str = "float32"  # 混合计算精度
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
         out = {}
-        x = sharding.activation_sharding_constraint(x)
+        x = sharding.activation_sharding_constraint(x)  # 多卡训练
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
         y = out["sa"] = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
@@ -98,7 +102,7 @@ class Encoder1DBlock(nn.Module):
         x = out["+sa"] = x + y
 
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
-        y = out["mlp"] = MlpBlock(
+        y = out["mlp"] = MlpBlock(  # FFN
             mlp_dim=self.mlp_dim,
             dropout=self.dropout,
             dtype_mm=self.dtype_mm,
@@ -109,6 +113,21 @@ class Encoder1DBlock(nn.Module):
         x = sharding.activation_sharding_constraint(x)
         return x, out
 
+class SpaceTimeSeparableBlock(nn.module):
+    """
+    MEM: Multi-Scale Embodied Memory for Vision Language Action Models
+    时空分离注意力
+    
+    """
+
+    def __call__():
+
+        pass
+
+
+    def _timePositionEmbedding():
+        pass
+    
 
 class Encoder(nn.Module):
     """Transformer Model Encoder for sequence to sequence translation."""
@@ -117,8 +136,8 @@ class Encoder(nn.Module):
     mlp_dim: int | None = None  # Defaults to 4x input dim
     num_heads: int = 12
     dropout: float = 0.0
-    scan: bool = False
-    remat_policy: str = "nothing_saveable"
+    scan: bool = False  # 共享计算图，加速编译并节省内存
+    remat_policy: str = "nothing_saveable"  # 控制反向传播时哪些激活值重算而不是存下来，时间换显存
     dtype_mm: str = "float32"
 
     @nn.compact
@@ -252,20 +271,20 @@ class _Module(nn.Module):
         )(x, deterministic=not train)
         encoded = out["encoded"] = x
 
-        if self.pool_type == "map":
+        if self.pool_type == "map":  # 可学习的 probe 做 cross-attention 池化
             x = out["head_input"] = MAPHead(
                 num_heads=self.num_heads,
                 mlp_dim=self.mlp_dim,
                 dtype=self.dtype_mm,
             )(x)
-        elif self.pool_type == "gap":
+        elif self.pool_type == "gap":  # 最大池化
             x = out["head_input"] = jnp.mean(x, axis=1)
-        elif self.pool_type == "0":
+        elif self.pool_type == "0":  # 取首个位置
             x = out["head_input"] = x[:, 0]
-        elif self.pool_type == "tok":
+        elif self.pool_type == "tok":  # CLS Token
             x = out["head_input"] = x[:, 0]
             encoded = encoded[:, 1:]
-        elif self.pool_type == "none":
+        elif self.pool_type == "none":  # 不池化
             pass
         else:
             raise ValueError(f"Unknown pool type: '{self.pool_type}'")
