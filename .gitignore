@@ -172,3 +172,16 @@ output*/
 .DS_Store
 *data*/
 superpower/
+superpowers/
+*command*
+*waypoints*
+rtvla*
+eval_offline*
+third_party/
+ref/
+.claude/
+.ruff_cache/
+.vscode/
+robocasa/
+plot_*
+docs/
