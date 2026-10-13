@@ -4,12 +4,14 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+from lerobot.common.constants import HF_LEROBOT_HOME
 from typing_extensions import override
 import tyro
 
@@ -19,9 +21,12 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.forklift_policy as forklift_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.mobile_aloha_policy as mobile_aloha_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -95,6 +100,11 @@ class DataConfig:
     # `meta/openpi_episode_split.json` manifest (see examples/aloha_real/convert_aloha_data_to_lerobot.py).
     # "all" preserves the default LeRobotDataset behavior of loading every episode.
     episode_split: Literal["all", "train", "val"] = "all"
+
+    # If set, further restricts `episode_split` (must not be "all") to episodes whose source task
+    # directory (recorded per-episode in `meta/openpi_episode_split.json`) is in this list, e.g.
+    # ("aloha_mobile_cabinet",). Lets you train on a subset of tasks without re-running the converter.
+    task_directories: Sequence[str] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -343,6 +353,164 @@ class LeRobotMobileAlohaDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+def _truncate_prechunked_action_norm_stats(
+    norm_stats: dict[str, _transforms.NormStats] | None, action_horizon: int
+) -> dict[str, _transforms.NormStats] | None:
+    """Truncate the "actions" norm stats' horizon axis to `action_horizon`.
+
+    Only has an effect when the stats were computed act-main-style, per chunk step (shape
+    `(H_max, action_dim)` -- see examples/forklift_sim_waypoints/compute_waypoint_norm_stats.py).
+    Plain pooled `RunningStats` output (shape `(action_dim,)`, `mean.ndim == 1`) is left untouched,
+    since there is no horizon axis to truncate -- this keeps horizon-ablation configs that still
+    point at old, pooled-format norm_stats.json files working unchanged.
+    """
+    if norm_stats is None or "actions" not in norm_stats:
+        return norm_stats
+    actions_stats = norm_stats["actions"]
+    if actions_stats.mean.ndim < 2:
+        return norm_stats
+    return {
+        **norm_stats,
+        "actions": dataclasses.replace(
+            actions_stats,
+            mean=actions_stats.mean[:action_horizon],
+            std=actions_stats.std[:action_horizon],
+            q01=None if actions_stats.q01 is None else actions_stats.q01[:action_horizon],
+            q99=None if actions_stats.q99 is None else actions_stats.q99[:action_horizon],
+        ),
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotForkliftDataConfig(DataConfigFactory):
+    """Data config for the Ackermann forklift sim task -- generic across state/action designs
+    (see examples/forklift_sim_command/README.md, examples/forklift_sim_waypoints/README.md, and any
+    future variant added under examples/forklift_sim_*/). `state_dim`/`action_dim` are read straight
+    out of the target `repo_id`'s own `meta/info.json` (written by that design's
+    convert_forklift_data_to_lerobot.py) instead of being duplicated here by hand -- so switching
+    designs, or the dataset changing a dim, only ever requires changing `repo_id`, never risks the
+    config drifting out of sync with the data it points at."""
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_front": "observation.images.cam_front"},
+                        "state": "observation.state",
+                        "actions": "action",
+                        # Without this, RepackTransform drops the "prompt" key added by
+                        # PromptFromLeRobotTask (applied before repack in create_torch_dataset),
+                        # since it only keeps keys present in this mapping.
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    def _read_dims(self) -> tuple[int, int, bool]:
+        """Returns (state_dim, action_dim, action_is_prechunked).
+
+        `action_is_prechunked` is True when the dataset's own `action` feature shape in
+        `meta/info.json` is 2D (`[action_horizon, action_dim]`, e.g. examples/forklift_sim_waypoints'
+        full-chunk-per-row scheme) rather than 1D (`[action_dim]`, e.g. examples/forklift_sim_command's
+        one-step-per-row scheme). LeRobot's own `delta_timestamps` row-chunking must be skipped for
+        the former -- it must not re-chunk something that is already a full per-row chunk -- see
+        `create()` below.
+        """
+        info_path = HF_LEROBOT_HOME / self.repo_id / "meta" / "info.json"
+        info = json.loads(info_path.read_text())
+        action_shape = info["features"]["action"]["shape"]
+        return info["features"]["observation.state"]["shape"][0], action_shape[-1], len(action_shape) > 1
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        state_dim, action_dim, action_is_prechunked = self._read_dims()
+        data_transforms = _transforms.Group(
+            inputs=[
+                forklift_policy.ForkliftInputs(
+                    state_dim=state_dim,
+                    action_dim=action_dim,
+                    # Lets a dataset converted once at some H_max (e.g. examples/forklift_sim_waypoints'
+                    # ACTION_HORIZON constant) serve a smaller model.action_horizon for ablations
+                    # without reconverting -- see ForkliftInputs.action_horizon's docstring.
+                    action_horizon=model_config.action_horizon if action_is_prechunked else None,
+                )
+            ],
+            outputs=[forklift_policy.ForkliftOutputs(action_dim=action_dim)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        base_config = self.create_base_config(assets_dirs, model_config)
+        norm_stats = _truncate_prechunked_action_norm_stats(
+            base_config.norm_stats, model_config.action_horizon
+        ) if action_is_prechunked else base_config.norm_stats
+
+        return dataclasses.replace(
+            base_config,
+            norm_stats=norm_stats,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=() if action_is_prechunked else self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRobocasaDataConfig(DataConfigFactory):
+    """Data config for RoboCasa base-static tasks merged by examples/robocasa/merge_target_static.py
+    (state 9 = eef_pos + eef_quat + gripper_qpos, action 7 = normalized eef delta + gripper_close).
+    RobocasaInputs turns the state quaternion into 6D rotation (state 11); actions are already eef
+    deltas, so no DeltaActions."""
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            cam: f"observation.images.{cam}" for cam in robocasa_policy.RobocasaInputs.EXPECTED_CAMERAS
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        # Keep the "prompt" added by PromptFromLeRobotTask, see LeRobotForkliftDataConfig.
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[robocasa_policy.RobocasaInputs()],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
@@ -907,7 +1075,15 @@ _CONFIGS = [
     # `meta/openpi_episode_split.json` train/val manifest consumed via `episode_split="train"` below.
     TrainConfig(
         name="pi05_mobile_aloha",
-        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            # `paligemma_variant` is left as the plain (non-lora) backbone: it gets frozen wholesale by
+            # `freeze_filter` below, so it never needs its own LoRA adapters. Only the action expert gets
+            # a `_lora` variant, since that's the only part we're actually fine-tuning.
+            action_expert_variant="gemma_300m_lora",
+        ),
         data=LeRobotMobileAlohaDataConfig(
             repo_id="mobile_aloha",
             # Mobile Aloha's 16D action space (14 arm/gripper + 2 base velocity) differs from the
@@ -921,7 +1097,160 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+        # Default num_workers=2 leaves most cores idle decoding this dataset's embedded images; bump it
+        # up since compute_norm_stats.py and training both iterate every frame through the same pipeline.
+        num_workers=8,
+        # Freeze every LLM param (paligemma backbone, ~2B params, + the action expert's own base weights)
+        # except ones on a `.*lora.*` path -- i.e. only the action expert's LoRA adapters train. This
+        # drops Adam optimizer state from covering ~3.3B params down to just the LoRA adapters, and casts
+        # every frozen param to bfloat16, which is what a full/unfrozen fine-tune of this model OOMs on a
+        # single GPU (`freeze_filter` defaults to nothing frozen).
+        # NOTE: `Pi0Config.get_freeze_filter()` is intentionally not used here -- it only freezes the
+        # backbone when `paligemma_variant` itself contains "lora"; with a plain paligemma_variant (as
+        # above) it leaves the whole ~2B-param backbone trainable, which is the opposite of what we want.
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        ),
+        # EMA keeps a shadow copy of every trainable param; skip it for LoRA finetunes (matches the
+        # convention used by pi0_libero_low_mem_finetune below).
+        ema_decay=None,
     ),
+
+    # pi05, forklift sim train, control-command action space (v, steering angle)
+    TrainConfig(
+        name="pi05_forklift_command",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            action_expert_variant="gemma_300m_lora",
+            tt_rtc_max_delay=10,  # apply Training-Time RTC
+        ),
+        data=LeRobotForkliftDataConfig(
+            # HF_LEROBOT_HOME must be set to .../data_tmp/forklift_simdata_lerobot so that
+            # HF_LEROBOT_HOME / repo_id resolves to .../forklift_simdata_lerobot/command, e.g.:
+            #   HF_LEROBOT_HOME=/home/geek/intern/storage/performance/zezhong_xie/project/data_tmp/forklift_simdata_lerobot \
+            #     uv run python scripts/compute_norm_stats.py --config-name pi05_forklift_command
+            repo_id="command",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # "train"/"val" requires a meta/openpi_episode_split.json manifest (written by
+                # examples/aloha_real/convert_aloha_data_to_lerobot.py's converter); our forklift
+                # converter doesn't write one and there's no train/val split need for this single
+                # narrow task, so just use every converted episode.
+                episode_split="all",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        num_workers=8,
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        ),
+        ema_decay=None,
+    ),
+
+    # pi05, forklift sim train, waypoint / relative-pose action space (dx, dy, dtheta, lift target)
+    TrainConfig(
+        name="pi05_forklift_waypoints",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            action_expert_variant="gemma_300m_lora",
+            # tt_rtc_max_delay=10,  # apply Training-Time RTC
+        ),
+        data=LeRobotForkliftDataConfig(
+            # HF_LEROBOT_HOME must be set to .../data_tmp/forklift_simdata_lerobot so that
+            # HF_LEROBOT_HOME / repo_id resolves to .../forklift_simdata_lerobot/waypoints, e.g.:
+            #   HF_LEROBOT_HOME=/home/geek/intern/storage/performance/zezhong_xie/project/data_tmp/forklift_simdata_lerobot \
+            #     uv run python scripts/compute_norm_stats.py --config-name pi05_forklift_waypoints
+            repo_id="waypoints",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_split="all",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        num_workers=8,
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        ),
+        ema_decay=None,
+    ),
+
+    # pi05, RoboCasa PandaOmron base-static tasks (76 tasks, arm only), eef delta action space
+    TrainConfig(
+        name="pi05_robocasa_target_static",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotRobocasaDataConfig(
+            # HF_LEROBOT_HOME must be set to .../data_tmp/RoboCasa/lerobot so that
+            # HF_LEROBOT_HOME / repo_id resolves to .../RoboCasa/lerobot/robocasa_target_static, e.g.:
+            #   HF_LEROBOT_HOME=/home/geek/intern/storage/performance/zezhong_xie/project/data_tmp/RoboCasa/lerobot \
+            #     uv run python scripts/compute_norm_stats.py --config-name pi05_robocasa_target_static
+            repo_id="robocasa_target_static",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # merge_target_static.py doesn't write a meta/openpi_episode_split.json manifest.
+                episode_split="all",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
+        num_workers=32,
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        ),
+        ema_decay=None,
+    ),
+
+    # Same as pi05_robocasa_target_static (same data / norm stats / LoRA / hyperparams), plus Training-Time RTC.
+    # Delay budget: RoboCasa control is 20 Hz (50 ms/step); measured e2e inference on an idle A5000 is ~175 ms
+    # (p99 190 ms) -> d ~= 4, and 220-280 ms under GPU contention -> d ~= 5-6. Train on d in {0..8} (400 ms) uniformly.
+    TrainConfig(
+        name="pi05_robocasa_target_static_ttrtc",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            action_expert_variant="gemma_300m_lora",
+            tt_rtc_max_delay=8,
+            tt_rtc_delay_distribution="uniform",
+        ),
+        data=LeRobotRobocasaDataConfig(
+            repo_id="robocasa_target_static",
+            # Reuse the baseline's norm stats (assets/pi05_robocasa_target_static/robocasa_target_static) so both
+            # runs see identically normalized data; assets dirs are otherwise keyed by config name.
+            assets=AssetsConfig(assets_dir="./assets/pi05_robocasa_target_static", asset_id="robocasa_target_static"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_split="all",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
+        num_workers=32,
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        ),
+        ema_decay=None,
+    ),
+
     #
     # Fine-tuning DROID configs.
     #
