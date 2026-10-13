@@ -42,6 +42,8 @@ class WebsocketPolicyServer:
             compression=None,
             max_size=None,
             process_request=_health_check,
+            # Inference blocks the event loop, so keepalive pings can time out under load; disable them.
+            ping_interval=None,
         ) as server:
             await server.serve_forever()
 
