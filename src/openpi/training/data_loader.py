@@ -128,10 +128,16 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def _load_episode_split_ids(dataset_meta: lerobot_dataset.LeRobotDatasetMetadata, split: Literal["train", "val"]) -> list[int]:
+def _load_episode_split_ids(
+    dataset_meta: lerobot_dataset.LeRobotDatasetMetadata,
+    split: Literal["train", "val"],
+    task_directories: Sequence[str] | None = None,
+) -> list[int]:
     """Reads the `meta/openpi_episode_split.json` manifest (written by
     examples/aloha_real/convert_aloha_data_to_lerobot.py) and returns the sorted converted episode ids
-    belonging to `split`.
+    belonging to `split`. If `task_directories` is given, further restricts to episodes whose
+    `source_task_directory` (recorded per-episode in the same manifest) is in that set, letting a subset
+    of tasks be selected without re-running the converter.
     """
     manifest_path = dataset_meta.root / "meta" / "openpi_episode_split.json"
     if not manifest_path.exists():
@@ -140,12 +146,37 @@ def _load_episode_split_ids(dataset_meta: lerobot_dataset.LeRobotDatasetMetadata
             "Convert the dataset with a converter that writes this manifest, or use episode_split='all'."
         )
     manifest = json.loads(manifest_path.read_text())
+    task_directory_set = set(task_directories) if task_directories is not None else None
     episode_ids = sorted(
-        record["converted_episode_id"] for record in manifest["episodes"] if record["split"] == split
+        record["converted_episode_id"]
+        for record in manifest["episodes"]
+        if record["split"] == split
+        and (task_directory_set is None or record["source_task_directory"] in task_directory_set)
     )
     if not episode_ids:
-        raise ValueError(f"No episodes found for split {split!r} in {manifest_path}.")
+        raise ValueError(
+            f"No episodes found for split {split!r}"
+            f"{f' and task_directories={sorted(task_directory_set)}' if task_directory_set else ''} "
+            f"in {manifest_path}."
+        )
     return episode_ids
+
+
+class _ScatteredEpisodeSubsetDataset(lerobot_dataset.LeRobotDataset):
+    """`LeRobotDataset.episode_data_index["from"/"to"]` is positioned by an episode's index within
+    `self.episodes`, but `LeRobotDataset._get_query_indices` looks it up using the *global*
+    `episode_index` value stored in each row -- which only matches when `self.episodes` is the
+    contiguous prefix 0..N-1 of the full dataset. openpi's `episode_split` manifest can select an
+    arbitrary scattered subset (e.g. a stratified train/val split), so translate the global id to its
+    position in `self.episodes` before indexing into `episode_data_index`.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._episode_id_to_position = {ep_id: position for position, ep_id in enumerate(self.episodes)}
+
+    def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict, dict]:
+        return super()._get_query_indices(idx, self._episode_id_to_position[ep_idx])
 
 
 def create_torch_dataset(
@@ -160,11 +191,12 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     episodes = (
-        _load_episode_split_ids(dataset_meta, data_config.episode_split)
+        _load_episode_split_ids(dataset_meta, data_config.episode_split, data_config.task_directories)
         if data_config.episode_split != "all"
         else None
     )
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset_cls = _ScatteredEpisodeSubsetDataset if episodes is not None else lerobot_dataset.LeRobotDataset
+    dataset = dataset_cls(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys

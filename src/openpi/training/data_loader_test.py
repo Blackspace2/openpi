@@ -127,3 +127,29 @@ def test_load_episode_split_ids_empty_split_raises(tmp_path):
     dataset_meta = types.SimpleNamespace(root=tmp_path)
     with pytest.raises(ValueError, match="No episodes found"):
         _data_loader._load_episode_split_ids(dataset_meta, "val")  # noqa: SLF001
+
+
+def test_load_episode_split_ids_filters_by_task_directory(tmp_path):
+    _write_split_manifest(
+        tmp_path,
+        [
+            {"converted_episode_id": 0, "source_task_directory": "cabinet", "source_episode_file": "e0", "prompt": "p", "split": "train"},
+            {"converted_episode_id": 1, "source_task_directory": "wipe_wine", "source_episode_file": "e1", "prompt": "p", "split": "train"},
+            {"converted_episode_id": 2, "source_task_directory": "cabinet", "source_episode_file": "e2", "prompt": "p", "split": "val"},
+        ],
+    )
+    dataset_meta = types.SimpleNamespace(root=tmp_path)
+
+    ids = _data_loader._load_episode_split_ids(dataset_meta, "train", ["cabinet"])  # noqa: SLF001
+
+    assert ids == [0]
+
+
+def test_load_episode_split_ids_task_directory_empty_result_raises(tmp_path):
+    _write_split_manifest(
+        tmp_path,
+        [{"converted_episode_id": 0, "source_task_directory": "cabinet", "source_episode_file": "e0", "prompt": "p", "split": "train"}],
+    )
+    dataset_meta = types.SimpleNamespace(root=tmp_path)
+    with pytest.raises(ValueError, match="No episodes found"):
+        _data_loader._load_episode_split_ids(dataset_meta, "train", ["wipe_wine"])  # noqa: SLF001
