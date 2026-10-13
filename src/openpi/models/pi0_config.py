@@ -32,6 +32,20 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Training-Time RTC (see docs/TT-RTC.md, docs/apply_tt-rtc.md): 0 = disabled (default, fully
+    # backward-compatible -- no behavior change anywhere in the model). N > 0 = train the flow-matching
+    # loss with a random-length (0..N inclusive) ground-truth action-chunk prefix pinned to its clean
+    # value, so the model learns to denoise only the remaining postfix -- this is what lets inference
+    # later drop in a real committed-action prefix + delay via `Pi0.sample_actions(action_prefix=...,
+    # prefix_delay=...)` at zero extra inference-time compute, replacing pseudoinverse-guidance RTC.
+    # Requires pi05=True (the mechanism relies on pi0.5's adaRMS suffix conditioning).
+    tt_rtc_max_delay: int = 0
+    # How Training-Time RTC samples the delay in {0, ..., tt_rtc_max_delay}:
+    #   "exp"     -- weights exp(-d), as in the kinetix reference (~63% of samples get delay 0, d>=3 ~5%).
+    #   "uniform" -- every delay equally likely, as in the TT-RTC paper's real-robot pi0.6 experiments.
+    # Use "uniform" when the deployment delay is known to sit well above 0 (e.g. RoboCasa: ~175 ms = d~4 at 20Hz).
+    tt_rtc_delay_distribution: str = "exp"
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -39,6 +53,10 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.tt_rtc_max_delay > 0:
+            assert self.pi05, "tt_rtc_max_delay > 0 (Training-Time RTC) requires pi05=True"
+            assert self.tt_rtc_max_delay < self.action_horizon, "tt_rtc_max_delay must be < action_horizon"
+            assert self.tt_rtc_delay_distribution in ("exp", "uniform"), self.tt_rtc_delay_distribution
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

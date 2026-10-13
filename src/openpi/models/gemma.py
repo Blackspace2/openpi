@@ -153,7 +153,14 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)  # 根据 time_cond 生成 3 组调制参数
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)  # s,β,g
+        if cond.ndim == x.ndim - 1:
+            # cond: [B, D], one conditioning vector shared by every token in the sequence (default path).
+            scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)  # s,β,g
+        else:
+            # cond: [B, S, D], a separate conditioning vector per token -- used by Training-Time RTC
+            # (Pi0Config.tt_rtc_max_delay > 0, see docs/apply_tt-rtc.md) so each action-chunk position
+            # gets its own adaRMS modulation instead of one shared across the whole chunk.
+            scale, shift, gate = jnp.split(modulation, 3, axis=-1)  # s,β,g
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -439,7 +446,9 @@ class Module(nn.Module):
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],  # 共享 batch_size；token数可以不同；embedding width 可以不同
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        # per-expert conditioning: None (no adaRMS), [B, D] (shared across the whole token sequence,
+        # default), or [B, S, D] (per-token, used by Training-Time RTC -- see RMSNorm.__call__ above).
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | at.Float[at.Array, "b _s _d"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,

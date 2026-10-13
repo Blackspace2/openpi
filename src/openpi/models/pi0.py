@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05  # 判断 pi0 or pi0.5
+        self.tt_rtc_max_delay = config.tt_rtc_max_delay  # Training-Time RTC 开关，0=关闭；见 docs/apply_tt-rtc.md
+        self.tt_rtc_delay_distribution = config.tt_rtc_delay_distribution  # delay 采样分布："exp" / "uniform"
         # 两个 Transformer expert
         paligemma_config = _gemma.get_config(config.paligemma_variant)  # Gemma-2B，负责 prefix
         action_expert_config = _gemma.get_config(config.action_expert_variant)  # 动作头 action-expert 300M，负责 suffix
@@ -153,12 +155,15 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b ah emb"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -173,10 +178,17 @@ class Pi0(_model.BaseModel):
 
         action_tokens = self.action_in_proj(noisy_actions)  # [B, 10, 32] -> [B, 10, 1024]
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        # timestemp:[B] -> time_embedding:[B,1024]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        # timestep is either shared across the whole action chunk ([B], the default) or, when
+        # Training-Time RTC (tt_rtc_max_delay > 0, see docs/apply_tt-rtc.md) is active, one value per
+        # action-chunk position ([B, ah]).
+        per_token_time = timestep.ndim == 2
+        time_flat = timestep.reshape(-1) if per_token_time else timestep
+        time_emb = posemb_sincos(time_flat, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        if per_token_time:
+            time_emb = time_emb.reshape(*timestep.shape, -1)  # [b, ah, emb]
         if self.pi05:
-            # time MLP (for adaRMS)
+            # time MLP (for adaRMS); Linear/swish act on the last axis, so this is unchanged whether
+            # time_emb is [b, emb] (default) or [b, ah, emb] (Training-Time RTC per-token conditioning).
             time_emb = self.time_mlp_in(time_emb)
             time_emb = nnx.swish(time_emb)
             time_emb = self.time_mlp_out(time_emb)
@@ -229,9 +241,37 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions  # 构造带噪动作 t=0, x_t=action 真实动作；t=1, x_t=noise 纯噪声
         u_t = noise - actions   # 速度场  [B, 10, 32], 真值 -> 噪声
 
+        rtc_prefix_mask = None
+        if self.tt_rtc_max_delay > 0:
+            # Training-Time RTC (docs/TT-RTC.md, docs/apply_tt-rtc.md): simulate an inference delay by
+            # pinning a random-length action-chunk prefix (positions already "committed" by a previous,
+            # now-superseded inference call) to its ground-truth clean value, and only train the
+            # flow-matching loss on the remaining postfix positions. openpi's time convention is
+            # t=0 -> clean action, t=1 -> noise (opposite of the TT-RTC paper's own convention), so
+            # "clean" below means time=0.0.
+            # Sample delay ~ Exp-decay over {0, ..., tt_rtc_max_delay}, biased toward delay=0 (matches the
+            # official reference `third_party/real-time-chunking-kinetix/src/model.py:280-282`, and real
+            # deployment latency: most inference calls finish with little/no delay, occasional slow calls
+            # produce a long tail up to tt_rtc_max_delay). Was plain uniform (jax.random.randint) before --
+            # switched to match the reference now that it's confirmed which end of the range it favors.
+            time_rng, delay_rng = jax.random.split(time_rng)
+            n_delay_values = self.tt_rtc_max_delay + 1
+            if self.tt_rtc_delay_distribution == "uniform":
+                # Every delay in {0, ..., tt_rtc_max_delay} equally likely (TT-RTC paper, real-robot setup).
+                delay = jax.random.randint(delay_rng, batch_shape, 0, n_delay_values)  # [*b]
+            else:
+                delay_weights = jnp.exp(jnp.arange(n_delay_values, dtype=jnp.float32)[::-1])
+                delay_weights = delay_weights / jnp.sum(delay_weights)
+                delay = jax.random.choice(delay_rng, n_delay_values, batch_shape, p=delay_weights)  # [*b]
+            rtc_prefix_mask = jnp.arange(self.action_horizon) < delay[..., None]  # [*b, ah]
+            time = jnp.where(rtc_prefix_mask, 0.0, time[..., None])  # [*b, ah]
+            time_expanded = time[..., None]  # [*b, ah, 1], overrides the [*b,1,1] version above
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
+
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)  # [B, 3*256+200=968, 2048] [B, 968] [968,]
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)  # pi0.5:[B, 10, 1024] [B, 10] [10] [B, 1024]
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)  # pi0.5:[B, 10, 1024] [B, 10] [10] [B, 1024] (或 tt_rtc 时 time:[B,ah], adarms_cond:[B,ah,1024])
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)  # pi0.5 [B, 978]
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)  # pi0.5 [978,]
         attn_mask = make_attn_mask(input_mask, ar_mask)  # [B, 978, 978]
@@ -241,7 +281,16 @@ class Pi0(_model.BaseModel):
         )  # pi0.5 suffix_out [B, 10, 1024]
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])  # [B, 10, 32]
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [B ,10]
+        per_token_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [B ,10]
+        if rtc_prefix_mask is not None:
+            # zero out the (already-committed, non-predicted) prefix positions and rescale so that a
+            # later plain jnp.mean(...) over the full `ah` axis (done by the training loop, not here)
+            # still averages correctly over just the postfix positions -- matching the reference
+            # implementation's `sum(loss*mask)/sum(mask)` normalization.
+            postfix_mask = jnp.logical_not(rtc_prefix_mask)
+            n_postfix = jnp.sum(postfix_mask, axis=-1, keepdims=True).clip(min=1)
+            per_token_loss = jnp.where(postfix_mask, per_token_loss, 0.0) * (self.action_horizon / n_postfix)
+        return per_token_loss
 
     @override
     def sample_actions(
@@ -251,7 +300,17 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,  # 默认是 10，从积分噪声到动作的迭代求解步数
         noise: at.Float[at.Array, "b ah ad"] | None = None,  # noise 就是 x_1 初始噪声 [B, action_horinzon, action_dim]
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        prefix_delay: at.Int[at.Array, " b"] | int | None = None,
     ) -> _model.Actions:
+        """Training-Time RTC 的推理侧用法(需要模型是用 tt_rtc_max_delay>0 训练出来的，见
+        docs/apply_tt-rtc.md)：传入上一次推理已产出、当前已提交执行的动作块 `action_prefix`
+        (shape 与 noise 相同 [B, ah, ad])，以及本次预计的延迟步数 `prefix_delay`(标量或 [B,] 整数，
+        表示前多少个动作位置保持 `action_prefix` 的值不变)。函数只会对 `prefix_delay:` 之后的位置去
+        噪，`action_prefix` 对应位置的动作原样返回、全程不加噪也不积分——是 inference-time RTC
+        (pseudoinverse guidance)的零额外计算开销替代方案。`action_prefix`/`prefix_delay` 都为 None
+        时(默认)行为与之前完全一致。
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -259,6 +318,15 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        rtc_prefix_mask = None
+        if action_prefix is not None:
+            if prefix_delay is None:
+                raise ValueError("prefix_delay must be given when action_prefix is given")
+            prefix_delay = jnp.broadcast_to(jnp.asarray(prefix_delay), (batch_size,))
+            rtc_prefix_mask = jnp.arange(self.action_horizon)[None, :] < prefix_delay[:, None]  # [b, ah]
+            # prefix positions are already-committed clean actions, not noise, right from t=1 onward
+            noise = jnp.where(rtc_prefix_mask[..., None], action_prefix, noise)
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -268,8 +336,15 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            if rtc_prefix_mask is not None:
+                x_t = jnp.where(rtc_prefix_mask[..., None], action_prefix, x_t)
+                time_input = jnp.where(
+                    rtc_prefix_mask, 0.0, jnp.broadcast_to(time, (batch_size, self.action_horizon))
+                )  # openpi convention: 0.0 = clean
+            else:
+                time_input = jnp.broadcast_to(time, batch_size)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, time_input
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -298,7 +373,10 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            x_next = x_t + dt * v_t
+            if rtc_prefix_mask is not None:
+                x_next = jnp.where(rtc_prefix_mask[..., None], action_prefix, x_next)  # keep prefix pinned exactly
+            return x_next, time + dt
 
         def cond(carry):
             x_t, time = carry

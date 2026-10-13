@@ -68,6 +68,13 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        # Training-Time RTC (docs/apply_tt-rtc.md): the client may send the already-committed action prefix as
+        # `actions` (raw env units, shape [ah, ad], only the first `prefix_delay` rows matter) plus `prefix_delay`.
+        # `actions` goes through the same input transforms as in training (Normalize + pad), then is handed to
+        # `sample_actions(action_prefix=..., prefix_delay=...)`. Without `prefix_delay` (or with 0) nothing changes.
+        prefix_delay = int(np.asarray(inputs.pop("prefix_delay", 0)))
+        if prefix_delay <= 0:
+            inputs.pop("actions", None)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -86,6 +93,12 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        if prefix_delay > 0:
+            if self._is_pytorch_model:
+                raise NotImplementedError("Training-Time RTC action prefix is only supported for JAX models")
+            sample_kwargs["action_prefix"] = inputs.pop("actions")
+            sample_kwargs["prefix_delay"] = jnp.asarray([prefix_delay], dtype=jnp.int32)
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
